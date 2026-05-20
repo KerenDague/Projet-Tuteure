@@ -11,9 +11,9 @@ from pathlib import Path
 import polars as pl
 
 # Configuration
-TEXT_COLUMN      = "Texte"
-LANGUE_COLUMN    = "Langue"
-ID_COLUMN        = "ID"
+TEXT_COLUMN = "Texte"
+LANGUE_COLUMN = "Langue"
+ID_COLUMN = "ID"
 HTML_TAG_PATTERN = re.compile(r"<[^>]*>")
 
 def parse_args() -> argparse.Namespace:
