@@ -1,0 +1,288 @@
+import matplotlib
+matplotlib.use("Agg")
+import re
+import os
+import argparse
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import spacy
+import time
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score, GridSearchCV
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.svm import SVC
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, classification_report
+from sklearn.utils.validation import check_is_fitted
+
+
+TEXT_COLUMN = 'Texte'
+LABEL_COLUMN = 'Langue'
+SPACY_MODEL = "fr_core_news_md"
+OUTPUT_DIR = "resultats_lcp"
+N_FOLDS = 5
+PARAM_GRID = {"svm__C": [0.01, 0.1, 1, 10, 100]}
+
+
+def count_syllables(word: str) -> int:
+    return max(1, len(re.findall(r'[aeiouyàâéèêëîïôùûü]+', word.lower())))
+
+
+def tree_depth(token) -> int:
+    depth = 0
+    t = token
+    while t.head != t:
+        depth += 1
+        t = t.head
+    return depth
+
+
+class POSExtractor(BaseEstimator, TransformerMixin):
+    def __init__(self, spacy_model=SPACY_MODEL):
+        self.spacy_model = spacy_model
+
+    def fit(self, X, y=None):
+        self.nlp_ = spacy.load(self.spacy_model)
+        self.fitted_ = True
+        return self
+
+    def transform(self, X):
+        check_is_fitted(self)
+        pos_strings = []
+        for doc in self.nlp_.pipe(X, disable=["ner"]):
+            seq = " ".join(token.pos_ for token in doc)
+            pos_strings.append(seq)
+        return np.array(pos_strings)
+
+
+class LinguisticExtractor(BaseEstimator, TransformerMixin):
+# Extrait 3 features : ponctuation, lisibilité, complexité syntaxique
+
+    def __init__(self, spacy_model=SPACY_MODEL):
+        self.spacy_model = spacy_model
+
+    def fit(self, X, y=None):
+        self.nlp_ = spacy.load(self.spacy_model)
+        self.fitted_ = True
+        return self
+
+    def transform(self, X):
+        check_is_fitted(self)
+        rows = []
+        for doc in self.nlp_.pipe(X, disable=["ner"]):
+            tokens = [t for t in doc if not t.is_space]
+            nb_tokens  = max(1, len(tokens))
+            phrases= list(doc.sents)
+            nb_phrases = max(1, len(phrases))
+
+            punct_ratio = sum(1 for t in tokens if t.text in ".,;:!?") / nb_tokens
+
+            mots_alpha= [t.text for t in tokens if t.is_alpha]
+            nb_mots = max(1, len(mots_alpha))
+            nb_syllabes = sum(count_syllables(m) for m in mots_alpha)
+            lisibilite = 206.835 - 1.015 * (nb_mots / nb_phrases) - 84.6 * (nb_syllabes / nb_mots)
+
+            depths = [tree_depth(t) for t in tokens if t.pos_ in ("NOUN", "VERB", "ADJ")]
+            profondeur_moy = float(np.mean(depths)) if depths else 0.0
+            ratio_sconj = sum(1 for t in tokens if t.pos_ == "SCONJ") / nb_phrases
+            complexite_syntaxique = profondeur_moy + ratio_sconj
+
+            rows.append([punct_ratio, lisibilite, complexite_syntaxique])
+
+        return np.nan_to_num(np.array(rows, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def load_data(file_path, text_col, label_col):
+    try:
+        try:
+            df = pd.read_csv(file_path, sep=';')
+            if df.shape[1] < 2:
+                df = pd.read_csv(file_path, sep=',')
+        except Exception:
+            df = pd.read_csv(file_path, sep=None, engine='python')
+    except FileNotFoundError:
+        print(f"Fichier introuvable : {file_path}")
+        return None, None
+
+    df = df.dropna(subset=[text_col, label_col])
+    print(f"{len(df)} exemples chargés — {df[label_col].nunique()} classes")
+    print(df[label_col].value_counts().to_string())
+    return df[text_col], df[label_col]
+
+
+def build_svm_pipeline():
+    char_vectorizer = TfidfVectorizer(analyzer='char', ngram_range=(3, 6), max_features=50000, sublinear_tf=True)
+    word_vectorizer = TfidfVectorizer(analyzer='word', ngram_range=(1, 2), max_features=30000, sublinear_tf=True)
+
+    pos_pipeline = Pipeline([
+        ("pos_extract", POSExtractor()),
+        ("pos_tfidf",   TfidfVectorizer()),
+    ])
+
+    vectorizer = ColumnTransformer([
+        ('char_tfidf', char_vectorizer, TEXT_COLUMN),
+        ('word_tfidf', word_vectorizer, TEXT_COLUMN),
+        ('pos',pos_pipeline, TEXT_COLUMN),
+        ('linguistic', LinguisticExtractor(),  TEXT_COLUMN),
+    ], transformer_weights={
+        'char_tfidf': 1.0,
+        'word_tfidf': 1.0,
+        'pos': 0.6,
+        'linguistic': 0.5,
+    })
+
+    return Pipeline([
+        ('features', vectorizer),
+        ('svm', SVC(kernel='linear', C=1.0, class_weight='balanced')),
+    ])
+
+
+def plot_confusion_matrix(y_true, y_pred, labels, out_dir):
+    cm  = confusion_matrix(y_true, y_pred, labels=labels)
+    cm_df = pd.DataFrame(cm, index=labels, columns=labels)
+    plt.figure(figsize=(max(8, len(labels) + 2), max(7, len(labels) + 1)))
+    sns.heatmap(cm_df, annot=True, fmt='d', cmap='Blues', linewidths=.5, annot_kws={"size": 11})
+    plt.title('Matrice de confusion — SVM', fontsize=13)
+    plt.ylabel('Vraie langue', fontsize=11)
+    plt.xlabel('Langue prédite', fontsize=11)
+    plt.xticks(rotation=45, ha="right")
+    plt.yticks(rotation=0)
+    plt.tight_layout()
+    path = os.path.join(out_dir, "confusion_matrice.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f" {path}")
+
+
+def plot_metrics_par_langue(df_metrics, out_dir):
+    df_plot = df_metrics[df_metrics["langue"] != "GLOBAL"].copy()
+    x, width = np.arange(len(df_plot)), 0.25
+    fig, ax  = plt.subplots(figsize=(max(10, len(df_plot) * 1.4), 6))
+    ax.bar(x - width, df_plot["precision"], width, label="Précision", color="#3498db", edgecolor="white")
+    ax.bar(x,df_plot["recall"],width, label="Rappel",color="#2ecc71", edgecolor="white")
+    ax.bar(x + width, df_plot["f1"], width, label="F1-score",  color="#e67e22", edgecolor="white")
+    ax.set_xticks(x)
+    ax.set_xticklabels(df_plot["langue"], rotation=30, ha="right", fontsize=11)
+    ax.set_ylim(0, 1.12)
+    ax.set_ylabel("Score")
+    ax.set_title("Précision, Rappel et F1-score par langue maternelle", fontsize=13)
+    ax.legend(fontsize=10)
+    global_f1 = df_metrics.loc[df_metrics["langue"] == "GLOBAL", "f1"].values[0]
+    ax.axhline(global_f1, color="navy", linestyle="--", linewidth=1.2, label="F1-macro global")
+    for bars in ax.containers:
+        ax.bar_label(bars, fmt="%.2f", fontsize=7.5, padding=2)
+    plt.tight_layout()
+    path = os.path.join(out_dir, "metrics_par_langue.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f" {path}")
+
+
+def plot_metrics_heatmap(df_metrics, out_dir):
+    df_plot = df_metrics[df_metrics["langue"] != "GLOBAL"].set_index("langue")
+    fig, ax = plt.subplots(figsize=(7, max(4, len(df_plot) + 1)))
+    sns.heatmap(
+        df_plot[["precision", "recall", "f1"]],
+        annot=True, fmt=".3f", cmap="RdYlGn",
+        vmin=0, vmax=1, linewidths=0.5, linecolor="lightgrey",
+        ax=ax, annot_kws={"size": 11},
+    )
+    ax.set_title("Métriques par langue — SVM", fontsize=13)
+    ax.set_xticklabels(["Précision", "Rappel", "F1-score"], rotation=0)
+    ax.tick_params(axis='y', rotation=0)
+    plt.tight_layout()
+    path = os.path.join(out_dir, "heatmap_metrics_langues.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f" {path}")
+
+
+def save_classification_report(y_true, y_pred, labels, out_dir):
+    report = classification_report(y_true, y_pred, target_names=labels, zero_division=0)
+    path = os.path.join(out_dir, "rapport_classification.txt")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(report)
+    print(f" {path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="SVM — identification de langue maternelle")
+    parser.add_argument("-f", "--fichierCSV", required=True, help="Chemin vers le fichier CSV")
+    parser.add_argument("--tag", default="", help="Suffixe ajouté au dossier de sortie")
+    args = parser.parse_args()
+
+    X, y = load_data(args.fichierCSV, TEXT_COLUMN, LABEL_COLUMN)
+    if X is None:
+        return
+
+    labels = sorted(y.unique())
+    df_train = pd.DataFrame({TEXT_COLUMN: X, LABEL_COLUMN: y})
+
+    X_train, X_test, y_train, y_test = train_test_split(df_train[[TEXT_COLUMN]], df_train[LABEL_COLUMN],test_size=0.2, random_state=42, stratify=y,)
+    print(f"Split 80/20 → train : {len(X_train)}  |  test : {len(X_test)}")
+
+    out_dir = f"{OUTPUT_DIR}_{args.tag}" if args.tag else OUTPUT_DIR
+    os.makedirs(out_dir, exist_ok=True)
+
+    print("\nGridSearchCV en cours (kernel=linear, C)...")
+    cv_strat = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=42)
+    grid = GridSearchCV(build_svm_pipeline(), PARAM_GRID, cv=cv_strat, scoring="f1_macro", n_jobs=1, verbose=1)
+    start = time.time()
+    grid.fit(X_train, y_train)
+    print(f"Meilleur C : {grid.best_params_['svm__C']}  (F1-macro CV : {grid.best_score_:.3f})")
+    print(f"Durée : {time.time() - start:.1f}s")
+    svm_model = grid.best_estimator_
+
+    y_pred = svm_model.predict(X_test)
+
+    acc = accuracy_score(y_test, y_pred)
+    f1_macro = f1_score(y_test, y_pred, average="macro",zero_division=0)
+    f1_weighted = f1_score(y_test, y_pred, average="weighted", zero_division=0)
+    prec_macro = precision_score(y_test, y_pred, average="macro", zero_division=0)
+    rec_macro = recall_score(y_test, y_pred, average="macro", zero_division=0)
+
+    cv_scores = cross_val_score(
+        svm_model, df_train[[TEXT_COLUMN]], df_train[LABEL_COLUMN],
+        cv=cv_strat, scoring="f1_macro", n_jobs=1,
+    )
+
+    precs = precision_score(y_test, y_pred, average=None, labels=labels, zero_division=0)
+    recs = recall_score(y_test, y_pred,  average=None, labels=labels, zero_division=0)
+    f1s = f1_score(y_test, y_pred, average=None, labels=labels, zero_division=0)
+    supports = [int(np.sum(np.array(y_test) == l)) for l in labels]
+
+    rows = [
+        {"langue": l, "precision": round(precs[i], 3), "recall": round(recs[i], 3),
+         "f1": round(f1s[i], 3), "support": supports[i]}
+        for i, l in enumerate(labels)
+    ]
+    rows.append({
+        "langue": "GLOBAL", "precision": round(prec_macro, 3),
+        "recall": round(rec_macro, 3), "f1": round(f1_macro, 3), "support": len(y_test),
+    })
+    df_metrics = pd.DataFrame(rows)
+
+    print("Résultats")
+    print(f"Accuracy  : {acc:.3f}")
+    print(f"F1-macro (split) : {f1_macro:.3f}")
+    print(f"F1-macro ({N_FOLDS}-fold CV) : {cv_scores.mean():.3f} ± {cv_scores.std():.3f}")
+    print(f"F1-weighted : {f1_weighted:.3f}")
+    print(f"Précision macro   : {prec_macro:.3f}")
+    print(f"Rappel macro : {rec_macro:.3f}")
+    print()
+    print(classification_report(y_test, y_pred, target_names=labels, zero_division=0))
+    print("Détail par langue :")
+    print(df_metrics.to_string(index=False))
+
+    print(f"\nFichiers générés dans '{out_dir}/' :")
+    plot_confusion_matrix(y_test, y_pred, labels, out_dir)
+    plot_metrics_par_langue(df_metrics, out_dir)
+    plot_metrics_heatmap(df_metrics, out_dir)
+    save_classification_report(y_test, y_pred, labels, out_dir)
+
+
+if __name__ == "__main__":
+    main()
